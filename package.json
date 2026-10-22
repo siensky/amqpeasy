@@ -1,15 +1,52 @@
 {
-  "name": "wave",
-  "module": "index.ts",
+  "name": "amqpeasy",
+  "module": "./dist/public.js",
+  "exports": {
+    ".": {
+      "types": "./dist/public.d.ts",
+      "import": "./dist/public.js"
+    },
+    "./zod": {
+      "types": "./dist/schema.d.ts",
+      "import": "./dist/schema.js"
+    },
+    "./errors": {
+      "types": "./dist/error.d.ts",
+      "import": "./dist/error.js"
+    }
+  },
+  "author": "siensky",
+  "license": "MIT",
   "type": "module",
   "devDependencies": {
-    "@types/bun": "latest"
-  },
-  "peerDependencies": {
+    "@types/bun": "latest",
     "typescript": "^7"
   },
   "dependencies": {
     "amqplib": "^2.2.0",
     "zod": "^4.6.7"
+  },
+  "version": "0.1.0",
+  "description": "A small RabbitMQ client with typed Zod subscriptions and AMQP error classes.",
+  "main": "./dist/public.js",
+  "types": "./dist/public.d.ts",
+  "files": [
+    "dist"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/siensky/amqpeasy.git"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test tests/unit",
+    "test:integration": "bun tests/run-integration.ts",
+    "test:package": "node tests/package/check.mjs",
+    "check": "bun run typecheck && bun test tests/unit && bun run build && bun run test:package",
+    "prepack": "bun run build"
   }
 }

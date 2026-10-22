@@ -1,0 +1,52 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    uses: ./.github/workflows/ci.yml
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - run: npm install --global npm@11
+      - uses: actions/download-artifact@v8
+        with:
+          name: verified-npm-package
+          path: .artifacts
+      - name: Check version tag and publish the tested tarball
+        run: |
+          node --input-type=module <<'JS'
+          import { readFileSync, readdirSync } from 'node:fs';
+          import { spawnSync } from 'node:child_process';
+          const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
+          if (process.env.GITHUB_REF_NAME !== `v${pkg.version}`) {
+            throw new Error('The tag must match the version in package.json');
+          }
+          const files = readdirSync('.artifacts').filter(file => file.endsWith('.tgz'));
+          if (files.length !== 1 || files[0] !== `${pkg.name}-${pkg.version}.tgz`) {
+            throw new Error('Expected exactly one verified package for this version');
+          }
+          const result = spawnSync('npm', ['publish', `.artifacts/${files[0]}`, '--access', 'public', '--ignore-scripts'], { stdio: 'inherit' });
+          if (result.error) throw result.error;
+          process.exit(result.status ?? 1);
+          JS

@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify on Node ${{ matrix.node }} and Bun
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+    services:
+      rabbitmq:
+        image: rabbitmq:4-management@sha256:c200fd496482cda18c412be4e6f244830e1e75949b8cf5f0e887cea9ea456109
+        env:
+          RABBITMQ_DEFAULT_USER: amqpeasy
+          RABBITMQ_DEFAULT_PASS: amqpeasy-test
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q check_port_connectivity"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      RABBITMQ_URL: amqp://amqpeasy:amqpeasy-test@127.0.0.1:5672
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun run test
+      - run: bun run build
+      - run: bun run test:integration
+      - run: bun run test:package
+      - uses: actions/upload-artifact@v7.0.2
+        if: matrix.node == 24
+        with:
+          name: verified-npm-package
+          path: .artifacts/*.tgz
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
