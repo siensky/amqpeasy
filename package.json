@@ -23,7 +23,6 @@
     "typescript": "^7"
   },
   "dependencies": {
-    "amqpeasy": "^0.2.0",
     "amqplib": "^2.2.0",
     "zod": "^4.6.7"
   },
