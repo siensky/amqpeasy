@@ -99,7 +99,7 @@ Order received: order-123 99
 
 For a JavaScript project using Node.js, save these two examples as `.mjs` files and run them with `node`. Their code works unchanged.
 
-This example uses a temporary queue that is deleted when the receiver disconnects. To keep the queue and retry failed messages, enable [retries and dead letters](#retries-and-dead-letters).
+This example uses a temporary queue that is deleted when the receiver disconnects. Set `subscribe.durable: true` to keep a named queue without enabling retries. For confirmed, persistent publishing and one job at a time, see [delivery and shutdown](#delivery-and-shutdown). To let the library retry failed messages, enable [retries and dead letters](#retries-and-dead-letters).
 
 ## Client API
 
@@ -225,9 +225,9 @@ await client.publish("", { text: "Maintenance starts at 22:00." });
 
 This snippet uses the `amqpEasy` and `z` imports shown above. With fanout, omit the subscription's routing key and pass `""` when publishing.
 
-Use **different queue names** when each receiver needs its own copy. With dead letters enabled, workers can use the **same queue name** to share the work; each message goes to one worker on that queue. Workers sharing a queue should use the same subscriptions and settings.
+Use **different queue names** when each receiver needs its own copy. With `subscribe.durable: true` or dead letters enabled, workers can use the **same queue name** to share the work; each message goes to one worker on that queue. Workers sharing a queue should use the same subscriptions and settings.
 
-Without dead letters, a queue is exclusive to its connection and cannot be shared by multiple clients.
+When both durable queues and dead letters are disabled, a queue is exclusive to its connection and cannot be shared by multiple clients.
 
 ## Retries and dead letters
 
@@ -354,9 +354,14 @@ AMQP classes are selected when the underlying error provides a matching numeric 
 
 ## Delivery and shutdown
 
+### Configure reliable delivery
+
 For durable jobs and an application-owned outbox, enable reliable publishing and configure the consumer separately:
 
 ```ts
+import amqpEasy from "amqpeasy";
+import { z } from "amqpeasy/zod";
+
 const client = await amqpEasy({
   uri: "amqp://localhost",
   publish: {
@@ -403,6 +408,93 @@ unsubscribe();
 - **Failure transfers remain confirmed.** Retry/dead-letter copies use persistent messages, confirms and mandatory routing before acknowledging the original. Failed transfers leave it unacknowledged. Copying and acknowledging are not atomic, so duplicates are possible.
 - **Shutdown has one deadline.** `disconnect()` rejects new publications, cancels the consumer, waits for active handlers and accepted publication calls, then closes. The default deadline is 30 seconds and includes cancellation and connection closure. On timeout it force-closes the transport and rejects with `ShutdownTimeoutError`; unfinished handlers never acknowledge or retry afterward. Their `AbortSignal` is aborted, but arbitrary JavaScript or external side effects cannot be forcibly cancelled. Unacknowledged jobs in retained queues become available for redelivery; exclusive queues are deleted on disconnect.
 - **Reconnection is manual.** Status becomes `connected` only after setup completes. Connection loss, channel closure, or broker cancellation of the consumer changes status to `disconnected`. Call `connect()` again to recreate channels, queue declarations, bindings, prefetch and consumer; concurrent calls share one attempt. Old handlers cannot acknowledge on the replacement connection. Status listeners receive future transitions asynchronously and can be removed with the returned function.
+
+
+### Handle publication failures
+
+Publishing options belong to the client configuration, not to individual `publish()` calls. The timeout must be an integer from 1 to 2,147,483,647 milliseconds. Confirms and mandatory routing apply to topic, direct and fanout exchanges; pass `""` as the routing key for fanout.
+
+With the reliable client configured above:
+
+```ts
+import { NoRouteError, PublishTimeoutError } from "amqpeasy/errors";
+
+try {
+  await client.publish("job.created", { id: "job-123" });
+  // Mark the outbox entry sent here, after the promise resolves.
+} catch (error) {
+  if (error instanceof NoRouteError) {
+    console.error("No matching queue: check the queue and its bindings.");
+  } else if (error instanceof PublishTimeoutError) {
+    console.error("Acceptance is unknown; leave the outbox entry pending.");
+  } else {
+    console.error("Publication failed:", error);
+  }
+  // Keep the outbox entry pending on every failure.
+}
+```
+
+A matching queue does not need an active consumer. `mandatory` checks routing to a queue, not whether a worker is currently running. A confirm does not mean the job has been processed.
+
+### Stop a worker gracefully
+
+Call `disconnect()` from your application's shutdown path, outside a running handler. Awaiting it inside the handler would make shutdown wait for that same handler.
+
+```ts
+import { ShutdownTimeoutError } from "amqpeasy/errors";
+
+async function shutdown() {
+  try {
+    await client.disconnect({ timeoutMs: 30_000 });
+  } catch (error) {
+    if (error instanceof ShutdownTimeoutError) {
+      console.error("Shutdown deadline reached; unfinished jobs were not acknowledged.");
+    } else {
+      console.error("Shutdown failed:", error);
+    }
+    process.exitCode = 1;
+  }
+}
+
+process.once("SIGTERM", () => { void shutdown(); });
+process.once("SIGINT", () => { void shutdown(); });
+```
+
+Use this with a long-running worker; do not also call `disconnect()` immediately after `connect()`. Timeout values must be integers from 1 to 2,147,483,647 milliseconds. Concurrent `disconnect()` calls share the first call's operation and deadline.
+
+Handlers receive an optional-to-use second argument, `{ signal }`. Pass the signal to cancellable operations, such as `fetch(url, { signal })`, or check `signal.throwIfAborted()` between work stages. Existing handlers accepting only the payload continue to work. The signal cannot undo already committed database changes or external side effects.
+
+### Observe status and reconnect
+
+| Status | Meaning |
+| --- | --- |
+| `disconnected` | Not connected, setup failed, or a required channel/consumer was lost. |
+| `connecting` | Opening the connection and setting up its channels and subscriptions. |
+| `connected` | Setup is complete and the client accepts publications. |
+| `disconnecting` | New publications are rejected while active work drains and resources close. |
+
+`onStatusChange` receives `{ status, error }`; `error` is optional. A normal close event can change status without an `onError` callback, so use status changes to observe connection availability. Listener failures are reported through `onError` and do not change the connection operation.
+
+After an unexpected disconnect, your application's retry loop can call:
+
+```ts
+try {
+  await client.connect();
+  console.log("RabbitMQ ready:", client.status);
+} catch (error) {
+  console.error("Reconnect failed; schedule another attempt in the application.", error);
+}
+```
+
+The application chooses the delay and stops reconnecting during intentional shutdown. The library does not automatically reconnect or replay publications. `connected` describes the local connection state; a later network failure can still make `publish()` reject.
+
+### Upgrade existing applications
+
+- Publishing remains unconfirmed and non-persistent unless you enable the new options. Use `confirms`, `persistent` and `mandatory` together for outbox publishing.
+- Existing one-argument handlers remain supported. Set `prefetch: 1` explicitly when jobs must run one at a time per consumer.
+- `disconnect()` now drains work with a 30-second default deadline; handle its rejected promise and allow sufficient time in your process supervisor.
+- Changing an existing queue from exclusive to durable requires a new queue name or a planned migration. Turning on dead-letter mode also changes the queue type to quorum. The library does not migrate or delete queues.
+- Keep `deadLetter: false` when the application owns business retries. A failed handler stays unacknowledged; with prefetch 1, further delivery pauses until that channel closes. Return successfully only after the result or application-owned retry is durably recorded.
 
 ## Development
 

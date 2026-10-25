@@ -23,10 +23,11 @@
     "typescript": "^7"
   },
   "dependencies": {
+    "amqpeasy": "^0.2.0",
     "amqplib": "^2.2.0",
     "zod": "^4.6.7"
   },
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A small RabbitMQ client with typed Zod subscriptions and AMQP error classes.",
   "main": "./dist/public.js",
   "types": "./dist/public.d.ts",
