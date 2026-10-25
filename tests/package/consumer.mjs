@@ -19,7 +19,7 @@ if (process.env.RABBITMQ_URL) {
   const queueName = `${exchangeName}.work`;
   let attempts = 0;
   const consumer = await api.default({ uri, exchangeName, subscribe: {
-    queueName, deadLetter: { maxRetries: 1, retryDelayMs: 100 }, subscriptions: [{ routingKey: "order.*", schema: z.object({ id: z.number() }),
+    queueName, prefetch: 1, deadLetter: { maxRetries: 1, retryDelayMs: 100 }, subscriptions: [{ routingKey: "order.*", schema: z.object({ id: z.number() }),
       handler: payload => {
         attempts++;
         if (attempts === 1) throw new Error("Retry this packaged message");
@@ -27,11 +27,12 @@ if (process.env.RABBITMQ_URL) {
       },
     }],
   } }, error => { failures.push(error); });
-  const publisher = await api.default({ uri, exchangeName });
+  const publisher = await api.default({ uri, exchangeName, publish: { confirms: true, persistent: true, mandatory: true } });
   let timer;
   try {
     await consumer.connect();
     await publisher.connect();
+    assert.equal(publisher.status, "connected");
     await publisher.publish("order.created", { id: 17 });
     const timeout = new Promise((_, reject) => {
       timer = setTimeout(() => reject(new Error("Packaged client did not receive the message")), 10000);

@@ -81,6 +81,8 @@ export async function setupDeadLetter(state: ClientState, channel: Channel): Pro
   const settings = subscription?.deadLetter;
   if (!subscription || !settings || !state.connection) throw new BaseError("Dead-letter settings require a connected consumer.");
   const { queueName } = subscription;
+  const { signal } = state.lifecycle;
+  const connection = state.connection;
   const deadQueue = `${queueName}.dead`;
   const retryQueue = `${queueName}.retry`;
   await channel.assertQueue(deadQueue, queueOptions());
@@ -89,9 +91,14 @@ export async function setupDeadLetter(state: ClientState, channel: Channel): Pro
     await channel.assertQueue(retryQueue, queueOptions(queueName, settings.retryDelayMs));
   }
 
-  const publisher = await state.connection.createConfirmChannel();
+  signal.throwIfAborted();
+  const publisher = await connection.createConfirmChannel();
+  signal.throwIfAborted();
   state.failureChannel = publisher;
   const pending = new Map<string, (cause?: unknown) => void>();
+  signal.addEventListener("abort", () => {
+    for (const finish of [...pending.values()]) finish(signal.reason);
+  }, { once: true });
   publisher.on("error", (error) => { state.reportError(error, true); });
   publisher.on("close", () => {
     if (state.failureChannel === publisher) state.failureChannel = null;
@@ -141,10 +148,11 @@ export async function setupDeadLetter(state: ClientState, channel: Channel): Pro
   }
 
   return async (message, error, retryable) => {
+    if (signal.aborted) return;
     const count = retryCount(message, queueName);
     const retry = retryable && count < settings.maxRetries;
     await move(message, retry ? retryQueue : deadQueue, error, retry ? count + 1 : count);
     // Only release the original after the broker confirms the routed copy.
-    channel.ack(message);
+    if (!signal.aborted) channel.ack(message);
   };
 }

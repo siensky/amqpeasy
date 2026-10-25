@@ -113,7 +113,9 @@ Creating a client does not open a connection. Call `connect()` when you are read
 | --- | --- |
 | `await client.connect()` | Opens the connection and starts any configured subscriptions. |
 | `await client.publish(routingKey, payload)` | Sends a JSON message to the client's exchange. |
-| `await client.disconnect()` | Closes the client's channels and connection. |
+| `await client.disconnect({ timeoutMs: 30000 })` | Stops deliveries, drains active work, and closes within the deadline. |
+| `client.status` | `disconnected`, `connecting`, `connected`, or `disconnecting`. |
+| `client.onStatusChange(listener)` | Subscribes to future status changes; returns an unsubscribe function. |
 
 One client can both publish and receive messages. You can also create separate clients; disconnecting one does not affect the others. Repeated calls to `connect()` reuse an open connection.
 
@@ -125,9 +127,15 @@ One client can both publish and receive messages. You can also create separate c
 | `exchangeName` | `"events"` | Exchange used for publishing and subscriptions. |
 | `exchangeType` | `"topic"` | `"topic"`, `"direct"`, or `"fanout"`. |
 | `subscribe` | Omitted | Configure this when the client should receive messages. |
-| `subscribe.queueName` | Required when subscribing | Queue to consume from. Use `""` for a generated name when dead letters are disabled. |
+| `subscribe.queueName` | Required when subscribing | Queue to consume from. Use `""` for a generated name only when durable queues and dead letters are disabled. |
+| `subscribe.durable` | `false` | Keep a named, non-exclusive queue after disconnect. Dead-letter mode always uses durable queues. |
+| `subscribe.prefetch` | Broker default | Maximum unacknowledged messages per consumer (0–65535). Use `1` for one at a time; `0` means unlimited. |
 | `subscribe.subscriptions` | Required when subscribing | An array of routing keys, Zod schemas, and handlers. |
 | `subscribe.deadLetter` | `false` | Enable retries and a dead-letter queue with `true` or a settings object. |
+| `publish.confirms` | `false` | Wait for broker acceptance. Enabled implicitly by `mandatory: true`. |
+| `publish.persistent` | `false` | Mark published messages as persistent. Combine with a durable queue and confirms. |
+| `publish.mandatory` | `false` | Reject publishing if no queue can receive the message. Requires confirms. |
+| `publish.timeoutMs` | `10000` | Publication deadline in milliseconds, including exchange setup. |
 
 Subscriptions are configured when you create the client. There is no separate `client.subscribe()` method.
 
@@ -275,7 +283,7 @@ This mode creates **durable quorum queues** and requires RabbitMQ support for at
 
 An existing temporary queue cannot be converted to a quorum queue in place. Use a new queue name when enabling this mode for an existing application. Changing the delay on an existing retry queue also requires a queue migration. amqpEasy never deletes existing queues for you.
 
-If dead letters are disabled, failed messages are reported through `onError` and left unacknowledged. They are not automatically retried, and the exclusive queue is deleted when its connection closes.
+If dead letters are disabled, failed messages are reported through `onError` and left unacknowledged. They are not automatically retried. Unless `subscribe.durable: true` is set, the exclusive queue is deleted when its connection closes.
 
 ## Handle errors
 
@@ -337,6 +345,8 @@ The callback reports failures; it does not swallow them. Failed `connect()`, `pu
 | 541 | `InternalError` |
 | `VALIDATION_ERROR` | `ValidationError` |
 | `FAILURE_TRANSFER_ERROR` | `FailureTransferError` |
+| `PUBLISH_TIMEOUT` | `PublishTimeoutError` |
+| `SHUTDOWN_TIMEOUT` | `ShutdownTimeoutError` |
 
 AMQP classes are selected when the underlying error provides a matching numeric code. Other failures, including system errors such as `ECONNREFUSED`, use `BaseError`.
 
@@ -344,16 +354,55 @@ AMQP classes are selected when the underlying error provides a matching numeric 
 
 ## Delivery and shutdown
 
-Keep these behaviors in mind when using the library:
+For durable jobs and an application-owned outbox, enable reliable publishing and configure the consumer separately:
 
-- **Acknowledgements are automatic.** A message is acknowledged after all matching handlers succeed. Matching handlers run in subscription order for each message; separate messages may be processed concurrently.
-- **Handlers may run more than once.** Make repeated processing safe, for example by recording an order ID before charging for an order. If several handlers match and a later one fails, a retry runs all matching handlers again.
-- **Publishing does not confirm delivery.** Normal `publish()` calls do not use publisher confirms, persistent messages, or mandatory routing. A resolved promise does not prove that RabbitMQ stored the message or that a consumer processed it. Messages without a matching queue may be discarded.
-- **Failure transfers are confirmed.** Retry and dead-letter copies use publisher confirms and mandatory routing before the original is acknowledged. A failed transfer reports `FailureTransferError` and leaves the original unacknowledged. A connection failure between copying and acknowledging can still produce duplicates.
-- **Reconnection is manual.** The client does not reconnect automatically after a lost connection.
-- **Disconnect closes the connection.** Call `await client.disconnect()` during application shutdown. It does not wait for running handlers to finish, so coordinate ongoing work before disconnecting.
+```ts
+const client = await amqpEasy({
+  uri: "amqp://localhost",
+  publish: {
+    confirms: true,
+    persistent: true,
+    mandatory: true,
+    timeoutMs: 10_000,
+  },
+  subscribe: {
+    queueName: "jobs",
+    durable: true,
+    prefetch: 1,
+    deadLetter: false,
+    subscriptions: [{
+      routingKey: "job.created",
+      schema: z.object({ id: z.string() }),
+      handler: async (job, { signal }) => {
+        // Commit the result or a scheduled business retry before returning.
+        // Use signal with operations that support cancellation.
+        signal.throwIfAborted();
+        console.log(job.id);
+      },
+    }],
+  },
+});
 
-Durable queues alone do not make normal published messages persistent across broker restarts.
+const unsubscribe = client.onStatusChange(({ status, error }) => {
+  console.log(status, error?.message);
+  // The application can schedule connect() after an unexpected disconnect.
+});
+
+await client.connect();
+await client.publish("job.created", { id: "job-123" });
+// With these publishing settings, the outbox can now mark this message sent.
+await client.disconnect({ timeoutMs: 30_000 });
+unsubscribe();
+```
+
+- **Publishing options are opt-in.** Existing calls without options keep unconfirmed, non-persistent publishing. With confirms, `publish()` waits for broker acceptance, not completion of a consumer handler. With mandatory routing, an unroutable message rejects even if the broker also confirms it. `mandatory: true` together with `confirms: false` is invalid.
+- **No automatic publication retry.** A timeout or lost connection can leave acceptance unknown. The application owns its outbox and decides whether to retry; consumers must tolerate duplicates.
+- **Acknowledgements follow successful handlers.** All matching handlers finish before a single ack. With `prefetch: 1`, each consumer receives at most one unacknowledged message at a time. Multiple clients still process independently.
+- **Durable queues do not require library retries.** `subscribe.durable: true` retains a named queue without enabling dead-letter behavior. Existing exclusive queues cannot be converted in place: use a new name or migrate the queue. Persistent messages, durable queues, and confirms work together to protect waiting jobs across broker restart.
+- **Business retries belong to the application.** With `deadLetter: false`, the library does not retry failed handlers. A thrown error leaves the message unacknowledged, which can block further deliveries with prefetch 1 until the channel closes. Persist an application-owned retry before returning successfully if that is your workflow. With `deadLetter: { maxRetries: 0 }`, failures instead move directly to the dead-letter queue without extra handler attempts. Broker redelivery of unacknowledged work can still occur after a disconnect.
+- **Failure transfers remain confirmed.** Retry/dead-letter copies use persistent messages, confirms and mandatory routing before acknowledging the original. Failed transfers leave it unacknowledged. Copying and acknowledging are not atomic, so duplicates are possible.
+- **Shutdown has one deadline.** `disconnect()` rejects new publications, cancels the consumer, waits for active handlers and accepted publication calls, then closes. The default deadline is 30 seconds and includes cancellation and connection closure. On timeout it force-closes the transport and rejects with `ShutdownTimeoutError`; unfinished handlers never acknowledge or retry afterward. Their `AbortSignal` is aborted, but arbitrary JavaScript or external side effects cannot be forcibly cancelled. Unacknowledged jobs in retained queues become available for redelivery; exclusive queues are deleted on disconnect.
+- **Reconnection is manual.** Status becomes `connected` only after setup completes. Connection loss, channel closure, or broker cancellation of the consumer changes status to `disconnected`. Call `connect()` again to recreate channels, queue declarations, bindings, prefetch and consumer; concurrent calls share one attempt. Old handlers cannot acknowledge on the replacement connection. Status listeners receive future transitions asynchronously and can be removed with the returned function.
 
 ## Development
 
@@ -374,7 +423,7 @@ RABBITMQ_URL=amqp://user:password@localhost:5672 bun run test:integration
 RABBITMQ_URL=amqp://user:password@localhost:5672 bun run test:package
 ```
 
-Tests cover routing, validation, isolated clients, errors, retries, and dead letters. The package check installs a local tarball into a temporary project and checks its imports and types in Node and Bun. With `RABBITMQ_URL`, it also tests message delivery through the installed package. It does not publish anything.
+Tests cover routing, validation, isolated clients, errors, retries, dead letters, confirmed publishing, connection loss, prefetch and shutdown. The TCP-proxy fault test requires a plain `amqp://` test broker. To also test broker restarts, set `RABBITMQ_TEST_CONTAINER` to the name of a dedicated local Docker broker container matching `RABBITMQ_URL`; that opt-in test restarts the named container twice. The package check installs a local tarball into a temporary project and checks its imports and types in Node and Bun. With `RABBITMQ_URL`, it also tests message delivery through the installed package. It does not publish anything.
 
 GitHub Actions runs checks on pull requests and pushes to `main` or `master`, using Node 22 and 24, Bun, and RabbitMQ. The release workflow runs on `v*` tags, verifies the version, and publishes the tested tarball after CI passes. It requires npm Trusted Publishing to be configured for `siensky/amqpeasy`, workflow `release.yml`, and environment `npm`. See [npm's setup instructions](https://docs.npmjs.com/trusted-publishers/).
 

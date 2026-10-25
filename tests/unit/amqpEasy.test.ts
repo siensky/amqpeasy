@@ -23,7 +23,10 @@ function makeChannel() {
     bindQueue: mock(async () => {}),
     consume: mock(async (_queue: string, handler: typeof consume) => {
       consume = handler;
+      return { consumerTag: "test-consumer" };
     }),
+    cancel: mock(async () => {}),
+    prefetch: mock(async () => {}),
     publish: mock(() => true),
     ack: mock(() => {}),
     nack: mock(() => {}),
@@ -153,7 +156,6 @@ test("publishing without a connection reports an error", async () => {
 test("successful messages and publishing keep working", async () => {
   await api.connect();
   expect(connectMock).toHaveBeenCalledWith("amqp://test");
-  await consume(null);
   const delivery = message('{"id":1}');
   await consume(delivery);
   expect(received).toEqual([{ id: 1 }]);
@@ -332,4 +334,212 @@ test("a throwing onError does not replace the operation error", async () => {
     await expect(api.connect()).rejects.toBeInstanceOf(errors.AccessRefusedError);
     expect(log).toHaveBeenCalledTimes(1);
   } finally { console.error = originalLog; }
+});
+
+function deferred<T = void>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(r => { resolve = r; });
+  return { promise, resolve };
+}
+const tick = () => new Promise(resolve => setTimeout(resolve, 0));
+
+async function confirmedClient(timeoutMs = 1000) {
+  const confirmations: Array<(error?: Error) => void> = [];
+  const publisher = Object.assign(makeChannel(), {
+    publish: mock((_exchange: string, _key: string, _body: Buffer, _options: import('amqplib').Options.Publish, confirm: (error?: Error) => void) => {
+      confirmations.push(confirm); return true;
+    }),
+  });
+  Object.assign(connection, { createConfirmChannel: mock(async () => publisher) });
+  api = await amqpEasy({ uri: "amqp://test", publish: { confirms: true, mandatory: true, persistent: true, timeoutMs } }, e => { reported.push(e); });
+  await api.connect();
+  return { publisher, confirmations };
+}
+
+test("confirmed publishing waits for the matching confirm and preserves persistence", async () => {
+  const { publisher, confirmations } = await confirmedClient();
+  let done = false;
+  const first = api.publish("one", 1).then(() => { done = true; });
+  const second = api.publish("two", 2);
+  await tick();
+  expect(done).toBe(false);
+  expect(publisher.publish.mock.calls[0]![3]).toMatchObject({ persistent: true, mandatory: true });
+  confirmations[1]!(); await second;
+  expect(done).toBe(false);
+  confirmations[0]!(); await first;
+  expect(done).toBe(true);
+});
+
+test("mandatory return rejects only its publication even when followed by a confirm", async () => {
+  const { publisher, confirmations } = await confirmedClient();
+  const first = api.publish("missing", 1);
+  const rejected = first.catch(error => error);
+  const second = api.publish("routed", 2);
+  await tick();
+  publisher.emit("return", { fields: { replyCode: 312, replyText: "NO_ROUTE" }, properties: publisher.publish.mock.calls[0]![3] });
+  confirmations[0]!(); confirmations[1]!();
+  expect(await rejected).toBeInstanceOf(errors.NoRouteError); await second;
+});
+
+test("negative confirm and channel close reject pending publications without retrying", async () => {
+  const { publisher, confirmations } = await confirmedClient();
+  const rejected = api.publish("one", 1).catch(error => error);
+  await tick(); confirmations[0]!(new Error("nack")); expect((await rejected).message).toBe("nack");
+  const closed = api.publish("two", 2).catch(error => error);
+  await tick(); publisher.emit("close"); expect(await closed).toMatchObject({ code: "CHANNEL_CLOSED" });
+  expect(api.status).toBe("disconnected");
+  expect(publisher.publish).toHaveBeenCalledTimes(2);
+});
+
+test("publication timeout covers exchange setup and never sends after expiry", async () => {
+  const { publisher } = await confirmedClient(10);
+  const setup = deferred<void>();
+  publisher.assertExchange.mockImplementation(() => setup.promise);
+  await expect(api.publish("one", 1)).rejects.toBeInstanceOf(errors.PublishTimeoutError);
+  setup.resolve(); await tick();
+  expect(publisher.publish).not.toHaveBeenCalled();
+});
+
+test("a missing confirm times out and a late confirm cannot change the result", async () => {
+  const { confirmations } = await confirmedClient(10);
+  await expect(api.publish("one", 1)).rejects.toBeInstanceOf(errors.PublishTimeoutError);
+  confirmations[0]!();
+  expect(reported).toHaveLength(1);
+});
+
+test("shutdown drains pending confirmations and rejects new publications", async () => {
+  const { publisher, confirmations } = await confirmedClient();
+  const sent = api.publish("one", 1);
+  await tick();
+  const closing = api.disconnect();
+  await expect(api.publish("two", 2)).rejects.toThrow("connected");
+  expect(publisher.close).not.toHaveBeenCalled();
+  confirmations[0]!(); await sent; await closing;
+  expect(publisher.close).toHaveBeenCalledTimes(1);
+});
+
+test("durable queues and prefetch are restored once on reconnect", async () => {
+  api = await amqpEasy({ uri: "amqp://test", subscribe: { queueName: "orders", durable: true, prefetch: 1,
+    subscriptions: [{ routingKey: "order.created", schema: z.unknown(), handler: () => {} }],
+  } }, () => {});
+  await api.connect();
+  expect(channel.assertQueue).toHaveBeenCalledWith("orders", { durable: true, exclusive: false, autoDelete: false });
+  expect(channel.prefetch).toHaveBeenCalledWith(1);
+  connection.emit("close");
+  const fresh = makeChannel(); const replacement = makeConnection(fresh);
+  connectMock.mockResolvedValue(replacement);
+  await Promise.all([api.connect(), api.connect()]);
+  expect(fresh.prefetch).toHaveBeenCalledWith(1);
+  expect(fresh.bindQueue).toHaveBeenCalledTimes(1);
+  expect(fresh.consume).toHaveBeenCalledTimes(1);
+  expect(api.status).toBe("connected");
+  // Events from the old connection must not invalidate its replacement.
+  connection.emit("close"); channel.emit("close");
+  expect(api.status).toBe("connected");
+});
+
+async function workingClient() {
+  const started = deferred(); const gate = deferred();
+  let signal!: AbortSignal;
+  api = await amqpEasy({ uri: "amqp://test", subscribe: { queueName: "orders", prefetch: 1,
+    subscriptions: [{ routingKey: "order.created", schema: z.unknown(), handler: async (_payload, context) => {
+      signal = context.signal; started.resolve(); await gate.promise;
+    } }],
+  } }, e => { reported.push(e); });
+  await api.connect();
+  const work = consume(message("{}"));
+  await started.promise;
+  return { gate, work, signal };
+}
+
+test("shutdown cancels deliveries and waits for the handler before ack and close", async () => {
+  const { gate, work, signal } = await workingClient();
+  const closing = api.disconnect(); await tick();
+  expect(channel.cancel).toHaveBeenCalledWith("test-consumer");
+  expect(channel.close).not.toHaveBeenCalled();
+  expect(channel.ack).not.toHaveBeenCalled();
+  expect(signal.aborted).toBe(false);
+  gate.resolve(); await work; await closing;
+  expect(channel.ack).toHaveBeenCalledTimes(1);
+  expect(connection.close).toHaveBeenCalledTimes(1);
+});
+
+test("shutdown timeout aborts work and prevents a late ack or retry after reconnect", async () => {
+  const { gate, work, signal } = await workingClient();
+  const destroy = mock(() => {});
+  Object.assign(connection, { connection: { stream: { destroy } } });
+  await expect(api.disconnect({ timeoutMs: 10 })).rejects.toBeInstanceOf(errors.ShutdownTimeoutError);
+  expect(signal.aborted).toBe(true); expect(destroy).toHaveBeenCalledTimes(1);
+  const fresh = makeChannel(); connectMock.mockResolvedValue(makeConnection(fresh));
+  await api.connect();
+  gate.resolve(); await work;
+  expect(channel.ack).not.toHaveBeenCalled(); expect(fresh.ack).not.toHaveBeenCalled();
+  expect(api.status).toBe("connected");
+});
+
+test("shutdown deadline also bounds a stalled channel close", async () => {
+  await api.connect();
+  const blocked = deferred(); channel.close.mockImplementation(() => blocked.promise);
+  const destroy = mock(() => {}); Object.assign(connection, { connection: { stream: { destroy } } });
+  await expect(api.disconnect({ timeoutMs: 10 })).rejects.toBeInstanceOf(errors.ShutdownTimeoutError);
+  expect(destroy).toHaveBeenCalledTimes(1); expect(api.status).toBe("disconnected");
+  blocked.resolve(); await tick();
+});
+
+test("a late connection after shutdown timeout is closed without replacing the new session", async () => {
+  const pending = deferred<typeof connection>(); connectMock.mockImplementationOnce(() => pending.promise);
+  const rejected = api.connect().catch(error => error);
+  await expect(api.disconnect({ timeoutMs: 10 })).rejects.toBeInstanceOf(errors.ShutdownTimeoutError);
+  const fresh = makeChannel(); connectMock.mockResolvedValue(makeConnection(fresh)); await api.connect();
+  pending.resolve(connection); expect(await rejected).toBeInstanceOf(errors.ShutdownTimeoutError);
+  expect(api.status).toBe("connected"); expect(connection.close).toHaveBeenCalledTimes(1);
+});
+
+test("status changes include consumer cancellation and listeners can unsubscribe", async () => {
+  const statuses: string[] = [];
+  const unsubscribe = api.onStatusChange(change => { statuses.push(change.status); });
+  await api.connect();
+  await consume(null); await tick();
+  expect(api.status).toBe("disconnected");
+  expect(reported.at(-1)?.code).toBe("CONSUMER_CANCELLED");
+  expect(statuses).toEqual(["connecting", "connected", "disconnected"]);
+  unsubscribe(); await api.disconnect();
+  expect(statuses).toHaveLength(3);
+});
+
+test("unsafe publishing and invalid queue settings are rejected before connecting", async () => {
+  for (const publish of [{ confirms: false, mandatory: true }, { timeoutMs: 0 }, { timeoutMs: Infinity }]) {
+    await expect(amqpEasy({ uri: "amqp://test", publish })).rejects.toBeInstanceOf(errors.BaseError);
+  }
+  for (const subscribe of [
+    { queueName: "", durable: true }, { queueName: "orders", prefetch: -1 },
+    { queueName: "orders", prefetch: 65536 }, { queueName: "orders", durable: false, deadLetter: true },
+  ]) {
+    await expect(amqpEasy({ uri: "amqp://test", subscribe: { ...subscribe, subscriptions: [] } })).rejects.toBeInstanceOf(errors.BaseError);
+  }
+});
+
+test("a late cancel reply cannot clear a replacement consumer tag", async () => {
+  await api.connect();
+  const cancelled = deferred(); channel.cancel.mockImplementation(() => cancelled.promise);
+  await expect(api.disconnect({ timeoutMs: 10 })).rejects.toBeInstanceOf(errors.ShutdownTimeoutError);
+  const fresh = makeChannel(); connectMock.mockResolvedValue(makeConnection(fresh));
+  await api.connect();
+  cancelled.resolve(); await tick();
+  await api.disconnect();
+  expect(fresh.cancel).toHaveBeenCalledWith("test-consumer");
+});
+
+test("late queue setup cannot start an old consumer with a replacement session", async () => {
+  const setup = deferred<{ queue: string }>(); channel.assertQueue.mockImplementation(() => setup.promise);
+  const opening = api.connect().catch(error => error);
+  await tick();
+  await expect(api.disconnect({ timeoutMs: 10 })).rejects.toBeInstanceOf(errors.ShutdownTimeoutError);
+  const fresh = makeChannel(); connectMock.mockResolvedValue(makeConnection(fresh));
+  await api.connect();
+  setup.resolve({ queue: "old" });
+  expect(await opening).toBeInstanceOf(errors.ShutdownTimeoutError);
+  expect(channel.consume).not.toHaveBeenCalled();
+  expect(fresh.consume).toHaveBeenCalledTimes(1);
+  expect(api.status).toBe("connected");
 });

@@ -1,4 +1,4 @@
-import amqpEasy, { type AmqpEasyClient, type AmqpEasySubscription } from "amqpeasy";
+import amqpEasy, { type AmqpEasyClient, type AmqpEasySubscription, type ConnectionStatus } from "amqpeasy";
 import { ValidationError } from "amqpeasy/errors";
 import { z } from "zod";
 
@@ -8,8 +8,10 @@ const subscriber: AmqpEasySubscription<typeof Order> = {
   handler(payload) { const id: number = payload.id; },
 };
 const client: AmqpEasyClient = await amqpEasy({
-  uri: "amqp://localhost", subscribe: { queueName: "test", deadLetter: { maxRetries: 3, retryDelayMs: 5000 }, subscriptions: [
-    { schema: Order, routingKey: "order.*", handler(payload) {
+  uri: "amqp://localhost", publish: { confirms: true, mandatory: true, persistent: true, timeoutMs: 1000 },
+  subscribe: { queueName: "test", durable: true, prefetch: 1, deadLetter: { maxRetries: 3, retryDelayMs: 5000 }, subscriptions: [
+    { schema: Order, routingKey: "order.*", handler(payload, { signal }) {
+      const abort: AbortSignal = signal;
       const id: number = payload.id;
       // @ts-expect-error Schema properties must retain their inferred types.
       const invalid: string = payload.id;
@@ -23,3 +25,10 @@ const client: AmqpEasyClient = await amqpEasy({
 }, error => {
   if (error instanceof ValidationError) console.error(error.cause);
 });
+const status: ConnectionStatus = client.status;
+const unsubscribe = client.onStatusChange(({ status, error }) => {
+  const current: ConnectionStatus = status;
+  if (error) console.error(error.code);
+});
+unsubscribe();
+await client.disconnect({ timeoutMs: 1000 });

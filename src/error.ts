@@ -149,3 +149,12 @@ export class FailureTransferError extends BaseError {
     super("Could not confirm moving the failed message. The original was not acknowledged.", "FAILURE_TRANSFER_ERROR", cause);
   }
 }
+
+/** Acceptance is unknown; the application decides whether to retry. */
+export class PublishTimeoutError extends BaseError {
+  constructor() { super("Timed out waiting for publication. Broker acceptance is unknown.", "PUBLISH_TIMEOUT"); }
+}
+
+export class ShutdownTimeoutError extends BaseError {
+  constructor() { super("Timed out draining or closing the client. Unfinished work was not acknowledged.", "SHUTDOWN_TIMEOUT"); }
+}

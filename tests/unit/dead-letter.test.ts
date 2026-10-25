@@ -23,7 +23,7 @@ function fixture(maxRetries = 3) {
     options: { uri: "amqp://test", exchangeName: "events", exchangeType: "topic", subscribe: {
       queueName: "orders", deadLetter: { maxRetries, retryDelayMs: 100 }, subscriptions: [],
     } },
-    channel, failureChannel: null,
+    channel, failureChannel: null, lifecycle: new AbortController(), handlers: new Set(),
     connection: { createConfirmChannel: async () => publisher },
     reportError(cause: unknown) {
       const error = cause instanceof BaseError ? cause : new BaseError(String(cause), undefined, cause);
@@ -144,7 +144,7 @@ test("consumer classifies bad JSON, schema failures, and handler failures", asyn
       if (scenario === "schema") throw new ValidationError();
       if (scenario === "handler") throw new Error("Temporary error");
     } }];
-    const channel = Object.assign(f.channel, { consume: async (_queue: string, handler: typeof consume) => { consume = handler; } });
+    const channel = Object.assign(f.channel, { consume: async (_queue: string, handler: typeof consume) => { consume = handler; return { consumerTag: "test" }; } });
     const failure = mock(async () => {});
     await consumeEvents(f.state, channel as unknown as Channel, "orders", failure);
     const delivery = message(); if (scenario === "json") delivery.content = Buffer.from("not json");
@@ -152,4 +152,16 @@ test("consumer classifies bad JSON, schema failures, and handler failures", asyn
     expect(failure).toHaveBeenCalledWith(delivery, expect.any(BaseError), scenario === "handler");
     expect(f.channel.ack).not.toHaveBeenCalled();
   }
+});
+
+test("aborting a pending failure transfer rejects it and never acknowledges after a late confirm", async () => {
+  const f = fixture();
+  const handle = await setupDeadLetter(f.state, f.channel as unknown as Channel);
+  const outcome = handle(message(), new BaseError("Failure"), true).catch(error => error);
+  f.state.lifecycle.abort(new Error("Shutdown deadline"));
+  expect(await outcome).toBeInstanceOf(FailureTransferError);
+  f.confirms[0]!();
+  expect(f.channel.ack).not.toHaveBeenCalled();
+  await handle(message(), new BaseError("Late handler"), true);
+  expect(f.publisher.publish).toHaveBeenCalledTimes(1);
 });

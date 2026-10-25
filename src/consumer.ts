@@ -29,7 +29,9 @@ export async function registerQueues(state: ClientState, channel: Channel): Prom
   await channel.assertExchange(exchangeName, exchangeType, { durable: true });
   const queue = subscribe.deadLetter
     ? { queue: subscribe.queueName }
-    : await channel.assertQueue(subscribe.queueName, { exclusive: true });
+    : await channel.assertQueue(subscribe.queueName, subscribe.durable
+      ? { durable: true, exclusive: false, autoDelete: false }
+      : { exclusive: true });
   for (const subscription of subscribe.subscriptions) {
     await channel.bindQueue(queue.queue, exchangeName, exchangeType === "fanout" ? "" : subscription.routingKey);
   }
@@ -39,8 +41,9 @@ export async function registerQueues(state: ClientState, channel: Channel): Prom
 export async function consumeEvents(state: ClientState, channel: Channel, queueName: string, handleFailure?: FailureHandler): Promise<void> {
   const { subscribe, exchangeType } = state.options;
   if (!subscribe) return;
-  await channel.consume(queueName, async (message: ConsumeMessage | null) => {
-    if (!message) return;
+  const { signal } = state.lifecycle;
+  const handlers = state.handlers;
+  const processMessage = async (message: ConsumeMessage) => {
     let retryable = false;
     let processingComplete = false;
     try {
@@ -55,13 +58,16 @@ export async function consumeEvents(state: ClientState, channel: Channel, queueN
         throw new BaseError(`No subscription matches routing key "${routingKey}".`);
       }
       retryable = true;
-      for (const subscription of subscriptions) await subscription.handle(payload);
+      for (const subscription of subscriptions) {
+        if (signal.aborted) return;
+        await subscription.handle(payload, { signal });
+      }
       retryable = false;
       processingComplete = true;
-      channel.ack(message);
+      if (!signal.aborted) channel.ack(message);
     } catch (cause) {
       const error = state.reportError(cause, true);
-      if (handleFailure && !processingComplete) {
+      if (handleFailure && !processingComplete && !signal.aborted) {
         try {
           await handleFailure(message, error, retryable && !(cause instanceof ValidationError));
         } catch (transferError) {
@@ -70,11 +76,31 @@ export async function consumeEvents(state: ClientState, channel: Channel, queueN
         }
       }
     }
+  }
+  const consumer = await channel.consume(queueName, (message: ConsumeMessage | null) => {
+    if (signal.aborted) return;
+    if (!message) {
+      if (state.status !== "disconnecting") {
+        state.invalidate(state.reportError(new BaseError("RabbitMQ cancelled the consumer.", "CONSUMER_CANCELLED"), true));
+      }
+      return;
+    }
+    const task = processMessage(message);
+    handlers.add(task);
+    void task.finally(() => handlers.delete(task));
+    return task;
   });
+  if (!signal.aborted) state.consumerTag = consumer.consumerTag;
 }
 
 export default async function startConsumer(state: ClientState, channel: Channel): Promise<void> {
+  const { signal } = state.lifecycle;
   const handleFailure = state.options.subscribe?.deadLetter ? await setupDeadLetter(state, channel) : undefined;
+  signal.throwIfAborted();
   const queueName = await registerQueues(state, channel);
+  signal.throwIfAborted();
+  const prefetch = state.options.subscribe?.prefetch;
+  if (prefetch !== undefined) await channel.prefetch(prefetch);
+  signal.throwIfAborted();
   await consumeEvents(state, channel, queueName, handleFailure);
 }
